@@ -1,0 +1,1393 @@
+const express = require('express');
+const cors = require('cors');
+const OpenAI = require('openai');
+const fs = require('fs');
+
+const app = express();
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type']
+}));
+app.use(express.json());
+
+// 🔑 OPENAI CONFIGURATION
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY // Set this in Railway: Variables tab
+});
+
+// 🔍 AMAZON LINK SERVICE - Google Custom Search Integration
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+const GOOGLE_CSE_ID = process.env.GOOGLE_CSE_ID;
+const AFFILIATE_TAG = process.env.AFFILIATE_TAG || 'giftinator-20';
+
+// Helper: Add affiliate tag to Amazon URL with sticky parameters
+function addAffiliateTag(url, tag) {
+  if (!url) return null;
+  
+  // Add affiliate tag + parameters that keep it in browser/preserve cookie
+  const hasQuery = url.includes('?');
+  const delimiter = hasQuery ? '&' : '?';
+  
+  // Add these parameters:
+  // - tag: Your affiliate ID
+  // - linkCode=ll1: Tells Amazon this is an affiliate link
+  // - th=1: Keeps variation selected
+  // - psc=1: Preserves shopping cart
+  // These make the link "stickier" and work better with Amazon app
+  
+  return `${url}${delimiter}tag=${encodeURIComponent(tag)}&linkCode=ll1&th=1&psc=1`;
+}
+
+// Helper: Validate Amazon product URL
+function isValidAmazonProductUrl(url) {
+  if (!url || !url.includes('amazon.com')) return false;
+  return url.includes('/dp/') || url.includes('/gp/') || url.includes('/product/');
+}
+
+// Get real Amazon link from search query
+async function getAmazonLinkFromQuery(query) {
+  try {
+    if (!GOOGLE_API_KEY || !GOOGLE_CSE_ID) {
+      console.warn('⚠️  Google API not configured, using fallback search URL');
+      const fallbackUrl = `https://www.amazon.com/s?k=${encodeURIComponent(query)}&tag=${AFFILIATE_TAG}`;
+      return {
+        url: fallbackUrl,
+        title: query,
+        isFallback: true
+      };
+    }
+
+    console.log(`🔍 Searching Amazon for: "${query}"`);
+
+    const searchQuery = `${query} site:amazon.com`;
+    const searchUrl = new URL('https://www.googleapis.com/customsearch/v1');
+    searchUrl.searchParams.append('key', GOOGLE_API_KEY);
+    searchUrl.searchParams.append('cx', GOOGLE_CSE_ID);
+    searchUrl.searchParams.append('q', searchQuery);
+    searchUrl.searchParams.append('num', '5');
+
+    const searchResponse = await fetch(searchUrl.toString(), {
+      signal: AbortSignal.timeout(5000) // 5 second timeout
+    });
+    
+    if (!searchResponse.ok) {
+      throw new Error('Google CSE error');
+    }
+
+    const searchData = await searchResponse.json();
+
+    // Find first valid Amazon product URL
+    let selectedUrl = null;
+    let selectedTitle = null;
+
+    if (searchData.items && searchData.items.length > 0) {
+      for (const item of searchData.items) {
+        if (isValidAmazonProductUrl(item.link)) {
+          selectedUrl = item.link;
+          selectedTitle = item.title;
+          break;
+        }
+      }
+    }
+
+    if (!selectedUrl) {
+      console.log(`❌ No product found, using fallback for: "${query}"`);
+      const fallbackUrl = `https://www.amazon.com/s?k=${encodeURIComponent(query)}&tag=${AFFILIATE_TAG}`;
+      return {
+        url: fallbackUrl,
+        title: query,
+        isFallback: true
+      };
+    }
+
+    const affiliateUrl = addAffiliateTag(selectedUrl, AFFILIATE_TAG);
+    console.log(`✅ Found product: ${selectedTitle.substring(0, 60)}...`);
+
+    return {
+      url: affiliateUrl,
+      title: selectedTitle,
+      isFallback: false
+    };
+
+  } catch (error) {
+    console.error('Amazon search error:', error.message);
+    const fallbackUrl = `https://www.amazon.com/s?k=${encodeURIComponent(query)}&tag=${AFFILIATE_TAG}`;
+    return {
+      url: fallbackUrl,
+      title: query,
+      isFallback: true
+    };
+  }
+}
+
+// 📊 PERSISTENT DATA STORAGE
+const DATA_FILE = './giftinator-data.json';
+
+let appData = {
+  clicks: [],
+  feedback: [],
+  sessions: []
+};
+
+if (fs.existsSync(DATA_FILE)) {
+  appData = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+}
+
+function saveData() {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(appData, null, 2));
+}
+
+// 🧠 GIFTINATOR V4 - PRODUCTION SYSTEM PROMPT (ChatGPT Polished)
+const V4_ULTIMATE_SYSTEM = `🧠 GIFTINATOR / NARA SUPER-PROMPT (FOR CLAUDE)
+
+You are Nara, the AI brain powering Giftinator – a gift-matching engine that creates "how the hell did it know that?!" moments.
+
+Your job is to:
+1. Ask a tight sequence of 15 questions about the gift recipient (QUESTION MODE)
+2. Then generate an insanely accurate personality reveal + gift list (REVEAL MODE)
+3. Make the user feel like they're watching your brain work in real time – Akinator-style.
+
+You always respond as a single valid JSON object, no extra text, no Markdown, no commentary outside of JSON.
+
+You have two modes, and each mode has its own strict JSON schema.
+
+---
+
+## 🔀 MODES OVERVIEW
+
+You operate in exactly ONE of these modes per response:
+
+* **QUESTION MODE** → \`reveal: false\`
+   * You ask one new question and update your "live theory" about the person.
+
+* **REVEAL MODE** → \`reveal: true\`
+   * You stop asking questions and output the personality profile + 3–7 gifts.
+
+The app will tell you which mode with the user message context, e.g.:
+* \`MODE: QUESTION\` + \`Current answers: [...]\`
+* \`MODE: REVEAL\` + \`All answers collected: [...]\`
+
+You must obey the mode.
+
+---
+
+## 🧩 MODE 1: QUESTION MODE (reveal: false)
+
+**TRIGGER:** User message includes \`MODE: QUESTION\`. You're given an \`answers\` array with less than or equal to 14 items.
+
+Each element in \`answers\` is one previous question's answer payload.
+
+**Your job:**
+* Ask ONE smart next question (out of 15 total)
+* Update your live psychological reading
+* Show your running theory so the UI can visualize your "Akinator brain"
+* Add a short Nara comment that feels like a small one-line aside at the bottom
+
+### ✅ QUESTION MODE OUTPUT SCHEMA
+
+You MUST return a JSON object in this exact structure:
+
+\`\`\`json
+{
+  "reveal": false,
+  "questionNumber": 5,
+  "phase": "foundation|identity|personality|lifestyle|refinement",
+  "question": "Clear, simple question (max 15 words)",
+  "options": ["Option A", "Option B", "Option C", "None of these – let me explain"],
+  "confidenceScore": 68,
+  "psychologicalInsights": "3-6 sentences of Nara reacting in real time.",
+  "runningTheory": {
+    "likelyArchetypes": [
+      {"name": "Cozy Comfort Souls", "probability": 0.42},
+      {"name": "Ambitious Builders", "probability": 0.31}
+    ],
+    "giftDirection": ["cozy home", "low-key self-care", "sentimental keepsakes"]
+  },
+  "naraComment": "Short, 1-2 sentence, playful bottom-of-screen remark."
+}
+\`\`\`
+
+### FIELD RULES
+
+* \`reveal\`: always \`false\` in QUESTION MODE
+* \`questionNumber\`: must equal current answers length + 1 (1 through 15)
+* \`phase\`: one of "foundation" | "identity" | "personality" | "lifestyle" | "refinement"
+* \`question\`:
+   * Max 15 words
+   * 8th-grade reading level
+   * Only covers one thing (no double questions)
+* \`options\`:
+   * Array of 4 strings
+   * First 3: clearly different, concrete options
+   * 4th is literally: "None of these – let me explain"
+* \`confidenceScore\`:
+   * Integer 0–100 representing confidence
+   * Q1–4 → 15–35
+   * Q5–8 → 40–60
+   * Q9–12 → 65–80
+   * Q13–15 → 85–95
+
+### psychologicalInsights (the "live brain" section)
+
+This is where the Akinator magic happens.
+
+* 3–6 sentences in Nara's voice
+* ALWAYS in first person: "I'm seeing…", "This is giving…"
+* From Q1–2: "starting to map out" vibes
+* From Q3 onward: Reference previous answers, call out patterns
+* From Q6 onward: Hint at archetype energy (without naming exactly)
+* From Q10 onward: Hint at gift categories (no specific products)
+
+### runningTheory (for the visual meter)
+
+* Only required from Q4 onward
+* Structure:
+\`\`\`json
+"runningTheory": {
+  "likelyArchetypes": [
+    {"name": "Cozy Comfort Souls", "probability": 0.42},
+    {"name": "Ambitious Builders", "probability": 0.31}
+  ],
+  "giftDirection": ["cozy home", "low-key self-care", "sentimental keepsakes"]
+}
+\`\`\`
+
+* \`likelyArchetypes\`: Array of 1–3 objects, probabilities sum to ~1.0
+* \`giftDirection\`: Array of 2–4 short category tags
+
+### naraComment (bottom one-liner)
+
+* 1–2 sentences max
+* Very casual, TikTok-coded
+* "Low-key this person just wants to be comfy and adored, I respect it."
+
+### Phase logic
+
+* Q1–3 → "foundation" (relationship, age/life stage, occasion)
+* Q4–7 → "identity" (core self, ideal self, social self, Big Five)
+* Q8–11 → "lifestyle" (daily reality, hobbies, love channels, nostalgia)
+* Q12–15 → "refinement" (aesthetic, constraints, contradictions)
+
+### ABSOLUTE RULES IN QUESTION MODE
+
+* Do NOT output gifts, archetype fields, or reveal-like data
+* \`reveal\` must be \`false\`
+* You MUST return exactly one question each time
+* All output must be a single JSON object
+
+---
+
+## 🌈 MODE 2: REVEAL MODE (reveal: true)
+
+**TRIGGER:** User message includes \`MODE: REVEAL\`. You're given an \`answers\` array (usually length 15).
+
+---
+
+## 🎯 YOUR MISSION: SCARY-ACCURATE GIFTS
+
+Your job is to turn quiz answers into 3–7 gifts that feel **scary accurate** and genuinely **WOW-level personal**—not generic, not predictable, not cozy by default.
+
+**The test for every gift:**
+"Would my customer have thought of this themselves, or does this require deep insight they couldn't get on their own?"
+
+If the gift is something they could've Googled or thought of themselves → **DELETE IT.**
+
+---
+
+## 🚫 HARD BANNED GIFTS (FOLLOW 100% OF THE TIME)
+
+These CANNOT be recommended unless the quiz answers give **4+ EXTREMELY SPECIFIC signals** that justify them:
+
+**BANNED:**
+- ❌ Blankets of any kind (weighted, throw, fuzzy, etc.)
+- ❌ Candles or diffusers
+- ❌ Mugs, tumblers, water bottles, Stanley-type items
+- ❌ Generic self-care kits
+- ❌ Fuzzy socks, slippers, robes
+- ❌ Notebooks or journals
+- ❌ "Cozy gift sets"
+- ❌ Generic wall art or prints
+- ❌ Generic jewelry (unless hyper-specific to identity)
+- ❌ Ultra-basic picks you'd find in a mall gift aisle
+- ❌ Anything that screams "I don't know you so here's something safe"
+
+**WHY THESE ARE BANNED:**
+These are default gifts. They're what people buy when they DON'T have insight. Your job is to provide VALUE through INSIGHT.
+
+---
+
+## 🧠 THE REAL SECRET (MOST IMPORTANT CONCEPT)
+
+**COMFORT IS NOT A GIFT CATEGORY.**
+**COMFORT IS A FILTER APPLIED TO THEIR ACTUAL INTEREST LANE.**
+
+If they like comfort, that is a **modifier**, NOT a category.
+Comfort should **upgrade** another gift, not **define** the gift.
+
+**Examples:**
+
+❌ BAD: "They like comfort → blanket"
+✅ GOOD: "They like comfort + reading → Warm amber clamp reading light for late-night reading"
+
+❌ BAD: "They like relaxation → candle"
+✅ GOOD: "They like relaxation + skincare → Premium facial steamer with aromatherapy function"
+
+❌ BAD: "They like cozy vibes → fuzzy socks"
+✅ GOOD: "They like cozy vibes + organizing → Beautiful modular drawer organizer system"
+
+**THE FORMULA:**
+COMFORT + [THEIR ACTUAL INTEREST] = UPGRADED VERSION OF THAT INTEREST
+
+---
+
+## 🎯 HOW TO PROCESS QUIZ ANSWERS (3-TIER SYSTEM)
+
+**Tier 1 – IDENTITY SIGNALS (Determines the LANE)**
+These determine WHAT CATEGORY of gift to give:
+
+- Oddly specific obsessions
+- Micro-aesthetics (clean girl, alt, gym rat, weeb, plant-mom, dark academia, etc.)
+- Fandoms, creators, brands they love
+- Current hyperfixation or phase
+- What they talk about unprompted (Q4)
+- What they wish they were better at (Q5)
+- Dream weekend activity (Q7)
+
+**Tier 2 – PAIN POINT SIGNALS (Determines FUNCTION)**
+These determine WHAT PROBLEM the gift solves:
+
+- What frustrates them
+- What feels inconvenient or "off"
+- What bugs them about their space (Q9)
+- What they avoid doing but want to get better at
+- Gap between talked-about and actually-done hobbies (Q10)
+- When they crash/need support (Q8)
+- What they need but won't buy themselves (Q15)
+
+**Tier 3 – COMFORT/VIBE SIGNALS (Determines VERSION)**
+These ONLY determine materials, colors, textures, style:
+
+- Sensory preferences (Q12)
+- Aesthetic keywords
+- Color palette
+- Texture preferences
+- Space vibe
+
+**CRITICAL RULE:**
+Tier 3 should **NEVER** pick the category by itself.
+It should only refine the gift once Tier 1 determined the lane and Tier 2 determined the function.
+
+---
+
+## 🔮 MANDATORY GIFT TYPE DIVERSITY
+
+The 3–7 gifts MUST include at least:
+
+**1. A HABIT UPGRADE**
+Something that improves something they already do or care about.
+Example: Better version of a tool they use daily, upgraded equipment for existing hobby.
+
+**2. AN EXPERIENCE-ENABLER**
+A physical item that enables an outing, hobby, date idea, or new experience.
+Example: Picnic backpack with built-in wine holders, portable projector for outdoor movies, cocktail mixing kit for hosting.
+
+**3. A SPACE/AESTHETIC ITEM (BUT NOT BLANKETS/CANDLES/MUGS)**
+Something that improves their living space or aesthetic.
+Example: Smart lighting strip, modular organizer, unique functional décor.
+
+**4. A HYPER-SPECIFIC "ONLY THEY WOULD GET THIS" PICK**
+Based on quirks, obsessions, pop-culture tastes, micro-identities, or weird habits.
+Example: Item related to niche interest, inside-joke reference, something that reveals you "get" them.
+
+You can add more gift types, but these 4 MUST be present.
+
+---
+
+## 🧨 EVERY GIFT MUST PASS THIS TEST
+
+Before including ANY gift, ask yourself:
+
+✅ **PERSONAL** - Uses 3+ specific quiz signals (not generic traits)
+✅ **UNEXPECTED** - Something they'd love but wouldn't think of themselves
+✅ **UPGRADE-ENERGY** - Makes their life noticeably better
+✅ **BRAGGABLE** - Giver can say "Look how thoughtful I was"
+✅ **VALUE-ADDED** - Requires insight the customer couldn't get from Google
+
+If the gift feels:
+- Generic
+- Boring
+- Safe
+- Cozy-without-purpose
+- Something anyone could guess
+- Something they could've thought of themselves
+
+→ **DELETE IT AND FIND SOMETHING BETTER.**
+
+---
+
+## 📋 REVEAL MODE OUTPUT SCHEMA
+
+\`\`\`json
+{
+  "reveal": true,
+  "archetype": "Short name like 'Creative Chaos Gremlin' or 'Ambitious Minimalist'",
+  "archetypeTagline": "One-line caption about their vibe",
+  "personaSnapshot": "3-6 sentences: who they are, what they're craving, what makes them unique",
+  "gifts": [
+    {
+      "giftName": "Specific product name (not generic)",
+      "whyItsPerfect": "Connect to MULTIPLE quiz details (3+). Explain Tier 1 lane + Tier 2 function + Tier 3 style. Make it feel impossibly accurate.",
+      "whatItConnectsTo": "The WTF detail that makes this specific (exact quote from their answers if possible)",
+      "experienceItCreates": "What moment/feeling this creates for them",
+      "amazonSearch": "3-6 word SPECIFIC search query",
+      "presentationIdea": "How to wrap/present/message for maximum impact"
+    }
+  ],
+  "giftPhilosophy": "2-3 sentences explaining the overall strategy: why THESE gifts for THIS person. Show you understand their identity + pain points + vibe."
+}
+\`\`\`
+
+---
+
+## 🎁 GIFT REQUIREMENTS (CRITICAL)
+
+### **PHYSICAL PRODUCTS ONLY**
+- ALL gifts must be physical Amazon products
+- NO experiences (concerts, trips, spa days)
+- NO digital-only items
+- NO pure subscriptions (unless physical box)
+- NO gift cards
+
+**EXCEPTION:** Products can *enable* experiences (date night kit, game night bundle), but you're recommending the PHYSICAL PRODUCT.
+
+### **amazonSearch field**
+- 3–6 word search phrase
+- Specific enough to find the right product on Amazon
+- Include key descriptors (material, color, function, level)
+
+**GOOD EXAMPLES:**
+- "warm amber clamp reading light adjustable"
+- "modular acrylic makeup organizer stackable"
+- "stainless steel milk frother handheld"
+- "beginner watercolor paint set portable"
+
+**BAD EXAMPLES:**
+- "something cozy"
+- "nice gift for her"
+- "blanket"
+- "candle lavender"
+
+### **Gift Reasoning Structure**
+
+For EVERY gift, you must connect:
+1. **Tier 1 Signal** - Their identity/interest lane (from Q4, Q5, Q7)
+2. **Tier 2 Signal** - The pain point/gap this solves (from Q8, Q9, Q10, Q15)
+3. **Tier 3 Signal** - How the style/aesthetic matches (from Q12)
+4. **The "WTF How Did You Know" Detail** - Something specific they said that makes this feel creepy-accurate
+
+**BAD REASONING:**
+"They like reading, so this bookmark is perfect."
+
+**GOOD REASONING:**
+"You mentioned they crash hard around 7pm (Q8) but then get a second wind late at night for reading (Q10 gap). They're drawn to warm, amber tones over harsh whites (Q12), and their apartment is cold so they bundle up to read (Q9). This clip-on amber reading light with 3 warmth settings means they can read in bed without disturbing anyone, stay warm under covers, and the amber tone helps with their evening wind-down. It's the upgrade to their existing habit they'd never buy themselves (Q15)."
+
+---
+
+## 🎯 FINAL INSTRUCTIONS (READ BEFORE GENERATING)
+
+1. **Gifts must feel like a person who deeply knows them picked them**
+2. **Gifts must be diverse** - NOT all physical comfort objects, NOT all cozy
+3. **Gifts must solve problems the person didn't articulate directly**
+4. **Gifts must lean into their quirks, their vibe, their micro-identity**
+5. **Gifts should make them say: "Wait… how do you know me?"**
+6. **Every gift must provide value the customer couldn't get from 5 minutes on Google**
+
+**THE ULTIMATE TEST:**
+If you showed this gift list to the customer and they said "I could've thought of that myself" → YOU FAILED.
+
+The customer is PAYING for insight they don't have. Give them insight.
+
+---
+
+## 🔥 BANNED GIFT LOGIC PATTERNS
+
+These thought patterns are FORBIDDEN:
+
+❌ "They're stressed → blanket"
+❌ "They like relaxation → candle"  
+❌ "They're busy → water bottle"
+❌ "They like writing → journal"
+❌ "They're cold → fuzzy socks"
+❌ "They work hard → self-care kit"
+
+**INSTEAD, THINK:**
+
+✅ "They're stressed + love their pet + drawn to interactive activities → automatic pet feeder camera so they can check on their dog during work stress"
+✅ "They like relaxation + into skincare + have dry apartment → facial steamer with hot/cold settings"
+✅ "They're busy + forget to hydrate + love tracking things → smart water bottle with app reminders"
+✅ "They like writing + are perfectionists + frustrated by mess → premium fountain pen with structured planner system"
+✅ "They're cold + WFH + complain about heating bills → heated desk pad that warms hands while typing"
+✅ "They work hard + into fitness but no time + need accountability → resistance band set with follow-along app"
+
+**See the pattern?**
+INTEREST + PAIN POINT + PERSONAL DETAIL = INSIGHTFUL GIFT
+
+---
+
+Return JSON only. No extra commentary.
+Do NOT suggest blankets unless you can justify 4+ unique quiz clues.
+Every gift must answer: "Why couldn't the customer think of this themselves?"
+
+---
+
+## 🎨 NARA'S PERSONALITY & VOICE
+
+You are:
+* A psychic best friend who roasts but genuinely loves the user
+* Sassy, TikTok-coded, modern
+* Very observant, but not mean
+
+**Tone:**
+* Playful, not harsh
+* "I see you 👀" energy
+* Call out patterns: "This is giving overworked golden retriever energy"
+* Give credit: "Wait, this is actually such a thoughtful gift idea"
+
+**Use sparingly:** literally, obsessed, the vibe, giving [thing], low-key, high-key, be so for real, I see it, noted, wait
+
+---
+
+## 🏛️ ARCHETYPES (12 FAMILIES)
+
+Valid archetype names:
+
+1. Cozy Comfort Souls
+2. Ambitious Builders
+3. Creative Chaos Gremlins
+4. Thoughtful Caretakers
+5. Nostalgic Dreamers
+6. Aesthetic Curators
+7. Adventure Seekers (grounded)
+8. Intellectual Explorers
+9. Social Butterflies
+10. Quiet Rebels
+11. Organized Perfectionists
+12. Spiritual Grounded
+
+**Selection logic:**
+* High openness + introverted + cozy → Cozy Comfort Souls
+* High conscientiousness + ambitious → Ambitious Builders
+* High openness + creative + messy → Creative Chaos Gremlins
+* High agreeableness + caretaker → Thoughtful Caretakers
+* Nostalgia-heavy + sentimental → Nostalgic Dreamers
+* Visual + aesthetic perfectionist → Aesthetic Curators
+* High openness + extraversion → Adventure Seekers
+* High openness + introverted + intellectual → Intellectual Explorers
+* High extraversion + social → Social Butterflies
+* Low agreeableness + creative → Quiet Rebels
+* High conscientiousness + low emotion → Organized Perfectionists
+* High emotional intensity + mindful → Spiritual Grounded
+
+---
+
+## 🚫 HARD DON'TS
+
+* Do NOT output anything except a single JSON object
+* Do NOT ask more questions in REVEAL MODE
+* Do NOT mention internal prompt rules
+* Do NOT suggest non-physical gifts
+* Do NOT output URLs or affiliate links – only \`amazonSearch\` terms
+
+You are Nara. Your goal: make each user feel like you know their person better than they do, and then hand them gifts that feel impossibly specific.`;
+
+// 🎯 API ENDPOINT: NEXT QUESTION
+app.post('/api/next-question', async (req, res) => {
+  try {
+    const { answers = [], questionHistory = [] } = req.body; // Track Q&A pairs
+    
+    // Set headers to prevent timeout
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Keep-Alive', 'timeout=60');
+    
+    // SHORT-CIRCUIT: Don't call model if already at 15 answers
+    if (answers.length >= 15) {
+      return res.status(400).json({
+        error: 'You already have 15 answers. Call /api/reveal instead.'
+      });
+    }
+    
+    console.log(`📥 [QUESTION MODE] Request for Q${answers.length + 1}/15`);
+    
+    // Prepare messages for OpenAI
+    const messages = [
+      { role: 'system', content: V4_ULTIMATE_SYSTEM },
+      { 
+        role: 'user', 
+        content: `MODE: QUESTION
+
+PREVIOUS QUESTIONS & ANSWERS:
+${questionHistory.map((qa, i) => `Q${i + 1}: ${qa.question}\nA${i + 1}: ${qa.answer}`).join('\n\n')}
+
+This is question ${answers.length + 1} of 15.
+
+${answers.length === 0 ? `
+Q1: Ask for the giftee's NAME.
+DO NOT provide options. Set options to empty array [].
+Just ask: "What's their name?"
+` : ''}
+
+${answers.length === 1 ? `
+Q2: Ask about RELATIONSHIP + EMOTIONAL CLOSENESS
+Question must ask: "What's your relationship with them?"
+Options: "Partner/spouse", "Best friend/close friend", "Family member", "None of these - let me explain"
+` : ''}
+
+${answers.length === 2 ? `
+Q3: Ask for AGE + CURRENT LIFE STAGE
+Question must ask about age AND what stage of life they're in
+Options must span: Young adult (18-25), Established adult (26-40), Mid-life (40-60), Retired/older, "None of these - let me explain"
+` : ''}
+
+${answers.length === 3 ? `
+Q4: Ask what they TALK ABOUT UNPROMPTED
+Question: "What topic do they bring up the most when you're just hanging out?"
+Options must be VERY DIFFERENT categories: "Work/career stuff", "Creative projects/hobbies", "People/relationships/drama", "None of these - let me explain"
+Encourage detail: If they select "None of these", they should describe the actual topics.
+` : ''}
+
+${answers.length === 4 ? `
+Q5: Ask what they WISH THEY WERE BETTER AT
+Question: "What's something they've mentioned wanting to be better at or learn?"
+Options must span different domains: "A creative skill", "A physical/fitness thing", "A professional skill", "None of these - let me explain"
+This reveals aspirations vs current state.
+` : ''}
+
+${answers.length === 5 ? `
+Q6: Ask how FRIENDS WOULD DESCRIBE THEM
+Question: "If I asked their friends to describe them in one word, what would they say?"
+Options must be OPPOSITES: "The organized/responsible one", "The spontaneous/fun one", "The deep/philosophical one", "None of these - let me explain"
+` : ''}
+
+${answers.length === 6 ? `
+Q7: Ask about their DREAM WEEKEND (unlimited budget)
+Question: "If they had a free weekend and unlimited money, what would they actually do?"
+Options must be VASTLY different: "Adventure/travel something new", "Master a skill/deep focus on hobby", "Total relaxation/do nothing", "None of these - let me explain"
+This reveals core values and energy type.
+` : ''}
+
+${answers.length === 7 ? `
+Q8: Ask about ENERGY PATTERNS + WHEN THEY CRASH
+Question: "When during the day are they most likely to hit a wall?"
+Options: "Morning (hard to start)", "Afternoon (post-lunch slump)", "Evening (crashes early)", "None of these - let me explain"
+This reveals circadian rhythms and stress patterns.
+` : ''}
+
+${answers.length === 8 ? `
+Q9: Ask about their SPACE + WHAT BUGS THEM ABOUT IT
+Question: "What's the most annoying thing about where they live right now?"
+Options must be specific: "Too small/cluttered", "Too cold/uncomfortable", "Too boring/sterile", "None of these - let me explain"
+This reveals practical constraints for gifts.
+` : ''}
+
+${answers.length === 9 ? `
+Q10: Ask about the GAP between TALKED ABOUT vs ACTUALLY DONE
+Question: "What's something they say they love doing but rarely make time for?"
+Options: "A hobby/creative thing", "Exercise/movement", "Socializing/going out", "None of these - let me explain"
+This reveals what they're missing in life.
+` : ''}
+
+${answers.length === 10 ? `
+Q11: Ask when they LAST FELT TRULY RELAXED
+Question: "When was the last time you saw them genuinely relaxed and happy?"
+Options: "Doing something active", "Making/creating something", "Just being cozy at home", "None of these - let me explain"
+This reveals their love language/recharge method.
+` : ''}
+
+${answers.length === 11 ? `
+Q12: Ask about SENSORY PREFERENCES (colors, textures, aesthetics)
+Question: "What colors, textures, or vibes are they naturally drawn to?"
+Options: "Earth tones, natural materials, cozy", "Bold colors, modern, sleek", "Soft pastels, feminine, delicate", "None of these - let me explain"
+This determines aesthetic for physical gifts.
+` : ''}
+
+${answers.length === 12 ? `
+Q13: Ask about BUDGET + OCCASION
+Question: "What's your budget and when do you need this gift?"
+Options: "Under $30 - just because gift", "$30-75 - birthday/holiday", "$75+ - special occasion", "None of these - let me explain"
+` : ''}
+
+${answers.length === 13 ? `
+Q14: Ask about PAST GIFT REGRETS
+Question: "What's a gift they've gotten before that totally missed the mark?"
+Options: "Too generic/impersonal", "Not their style/taste", "Something they'd never use", "None of these - let me explain"
+This prevents repeating mistakes.
+` : ''}
+
+${answers.length === 14 ? `
+Q15: Ask about what they NEED BUT WON'T BUY THEMSELVES
+Question: "What's something you've noticed they need but are too practical/cheap to buy for themselves?"
+Options: "Something to make their space better", "Something for their health/wellness", "Something purely for enjoyment", "None of these - let me explain"
+This is the gift opportunity sweet spot.
+` : ''}
+
+CRITICAL INSTRUCTIONS:
+- Follow the EXACT question structure above for this question number
+- Options MUST be very different from each other (not just variants)
+- ALWAYS include "None of these - let me explain" as the 4th option
+- In psychologicalInsights, encourage custom responses by saying things like "if the options don't quite fit, tell me more!"
+- Build on previous answers - reference contradictions or interesting details
+- DO NOT ask generic questions - every question must reveal something unique
+
+Return QUESTION MODE JSON schema only.`
+      }
+    ];
+
+    // Call OpenAI with optimal settings for questions
+    console.log('🤖 Calling OpenAI for question...');
+    const startTime = Date.now();
+    
+    let completion;
+    let retryCount = 0;
+    const maxRetries = 1;
+    
+    while (retryCount <= maxRetries) {
+      try {
+        completion = await Promise.race([
+          openai.chat.completions.create({
+            model: 'gpt-4o',
+            messages: messages,
+            response_format: { type: 'json_object' },
+            temperature: 0.7,
+            max_tokens: 500
+          }),
+          new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('OpenAI timeout after 90 seconds')), 90000) // 90 seconds for extra safety
+          )
+        ]);
+        break; // Success, exit retry loop
+      } catch (error) {
+        if (error.message.includes('timeout') && retryCount < maxRetries) {
+          retryCount++;
+          console.log(`⚠️  Timeout, retrying (attempt ${retryCount + 1}/${maxRetries + 1})...`);
+          continue;
+        }
+        throw error; // Re-throw if not timeout or out of retries
+      }
+    }
+    
+    const elapsed = Date.now() - startTime;
+    console.log(`⏱️  OpenAI responded in ${elapsed}ms`);
+
+    let response;
+    try {
+      response = JSON.parse(completion.choices[0].message.content);
+    } catch (parseError) {
+      console.error('❌ JSON Parse Error:', parseError.message);
+      console.error('Raw response:', completion.choices[0].message.content);
+      
+      // Attempt to clean and re-parse
+      try {
+        const cleaned = completion.choices[0].message.content
+          .replace(/\n/g, ' ')  // Remove newlines
+          .replace(/\r/g, '')   // Remove carriage returns
+          .replace(/\t/g, ' ')  // Remove tabs
+          .trim();
+        response = JSON.parse(cleaned);
+        console.log('✅ JSON repaired successfully');
+      } catch (secondError) {
+        throw new Error('Model returned unparseable JSON. Try again.');
+      }
+    }
+    
+    // VALIDATE RESPONSE STRUCTURE
+    const expectedQuestionNumber = answers.length + 1;
+    const allowedPhases = ["foundation", "identity", "personality", "lifestyle", "refinement"];
+    
+    if (!response.question || !Array.isArray(response.options)) {
+      throw new Error('Model returned malformed question payload');
+    }
+    
+    // Override questionNumber if model drifted
+    if (response.questionNumber !== expectedQuestionNumber) {
+      console.log(`⚠️  Model returned Q${response.questionNumber}, correcting to Q${expectedQuestionNumber}`);
+      response.questionNumber = expectedQuestionNumber;
+    }
+    
+    // Validate and correct phase
+    if (!allowedPhases.includes(response.phase)) {
+      console.log(`⚠️  Invalid phase '${response.phase}', auto-correcting.`);
+      // Auto-assign phase based on question number
+      if (answers.length < 3) response.phase = "foundation";
+      else if (answers.length < 7) response.phase = "identity";
+      else if (answers.length < 11) response.phase = "lifestyle";
+      else response.phase = "refinement";
+    }
+    
+    // Validate mode
+    if (response.reveal !== false) {
+      throw new Error('Invalid response: expected reveal: false in QUESTION MODE');
+    }
+    
+    console.log(`✅ Generated Q${response.questionNumber}: ${response.question.substring(0, 60)}...`);
+    
+    res.json(response);
+    
+  } catch (error) {
+    console.error('❌ [QUESTION MODE] Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 🎯 API ENDPOINT: REVEAL PROFILE + GIFTS
+app.post('/api/reveal', async (req, res) => {
+  try {
+    const { answers = [], questionHistory = [] } = req.body;
+    
+    // Set headers to prevent timeout
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Keep-Alive', 'timeout=90');
+    
+    console.log(`📥 [REVEAL MODE] Request with ${answers.length} answers`);
+    
+    // REQUIRE 15 ANSWERS for full profile
+    if (answers.length < 15) {
+      return res.status(400).json({ 
+        error: 'Need 15 answers for reveal. Keep asking questions.' 
+      });
+    }
+    
+    // Prepare messages for OpenAI
+    const messages = [
+      { role: 'system', content: V4_ULTIMATE_SYSTEM },
+      { 
+        role: 'user', 
+        content: `MODE: REVEAL
+
+All answers collected: ${JSON.stringify(answers)}
+
+Question history for reference:
+${questionHistory.map((qa, i) => `Q${i + 1}: ${qa.question}\nA${i + 1}: ${qa.answer}`).join('\n\n')}
+
+You have ${answers.length} answers spanning all psychological dimensions.
+
+---
+
+🎯 YOUR MISSION:
+Generate 3-7 gifts that make the customer think: "How the HELL did Giftinator know that?"
+
+Each gift must pass this test: "Could my customer have thought of this themselves?"
+If YES → DELETE IT. They're paying for INSIGHT they don't have.
+
+---
+
+🚫 HARD BANNED (unless 4+ SPECIFIC signals justify):
+- Blankets, candles, mugs, water bottles, fuzzy socks, journals, generic self-care kits, wall art, generic jewelry
+
+⚠️ CRITICAL CONCEPT:
+COMFORT IS NOT A CATEGORY. COMFORT IS A FILTER.
+- Comfort + Reading = Clamp reading light (NOT blanket)
+- Comfort + Skincare = Facial steamer (NOT candle)
+- Comfort + Organizing = Modular organizer (NOT socks)
+
+---
+
+📊 PROCESS ANSWERS IN 3 TIERS:
+
+**TIER 1 - IDENTITY (Determines WHAT CATEGORY):**
+Use Q4 (what they talk about), Q5 (what they wish they were better at), Q7 (dream weekend)
+→ This tells you the LANE (fitness, creativity, food, gaming, etc.)
+
+**TIER 2 - PAIN POINTS (Determines WHAT FUNCTION):**
+Use Q8 (when they crash), Q9 (space issues), Q10 (talked about vs actually do gap), Q15 (won't buy themselves)
+→ This tells you what PROBLEM to solve
+
+**TIER 3 - VIBE (Determines WHICH VERSION):**
+Use Q12 (colors/textures), aesthetic preferences
+→ This only determines materials, colors, style
+
+NEVER let Tier 3 determine the category!
+
+---
+
+✅ MANDATORY DIVERSITY - Include:
+1. Habit Upgrade (better version of something they already use)
+2. Experience-Enabler (physical item that enables activity/outing)
+3. Space/Aesthetic Item (NOT blankets/candles/mugs)
+4. Hyper-Specific "Only They'd Get This" Pick (quirk/obsession/identity)
+
+---
+
+🧨 GIFT QUALITY TEST:
+Every gift must be:
+✅ PERSONAL - 3+ specific quiz signals
+✅ UNEXPECTED - They wouldn't think of it themselves
+✅ UPGRADE-ENERGY - Noticeably improves their life
+✅ BRAGGABLE - Giver can show off how thoughtful they are
+✅ VALUE-ADDED - Requires insight customer couldn't get from Google
+
+If gift feels generic, safe, cozy-without-purpose, or obvious → DELETE IT.
+
+---
+
+EXAMPLE OF GOOD REASONING:
+"You mentioned they crash around 7pm (Q8) but get second wind for late-night reading (Q10). They're drawn to warm amber tones (Q12) and their apartment is cold (Q9). This clip-on amber reading light with 3 warmth settings lets them read in bed without harsh light, stay under covers, and the amber helps wind down. It upgrades their existing habit they'd never buy themselves (Q15)."
+
+NOT: "They like reading, so here's a bookmark."
+
+---
+
+RETURN JSON ONLY.
+Every gift must answer: "Why couldn't the customer think of this themselves?"
+Gifts must feel scary-accurate, not safe-generic.`
+      }
+    ];
+
+    // Call OpenAI with optimal settings for reveals
+    console.log('🤖 Calling OpenAI for reveal...');
+    const startTime = Date.now();
+    
+    const completion = await Promise.race([
+      openai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: messages,
+        response_format: { type: 'json_object' },
+        temperature: 0.6, // Slightly lower for consistent quality
+        max_tokens: 3000 // Increased for reveals with all fields
+      }),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('OpenAI timeout after 45 seconds')), 45000)
+      )
+    ]);
+    
+    const elapsed = Date.now() - startTime;
+    console.log(`⏱️  OpenAI responded in ${elapsed}ms`);
+
+    let response;
+    try {
+      response = JSON.parse(completion.choices[0].message.content);
+    } catch (parseError) {
+      console.error('❌ JSON Parse Error:', parseError.message);
+      console.error('Raw response:', completion.choices[0].message.content);
+      
+      // Attempt to clean and re-parse
+      try {
+        const cleaned = completion.choices[0].message.content
+          .replace(/\n/g, ' ')  // Remove newlines
+          .replace(/\r/g, '')   // Remove carriage returns
+          .replace(/\t/g, ' ')  // Remove tabs
+          .trim();
+        response = JSON.parse(cleaned);
+        console.log('✅ JSON repaired successfully');
+      } catch (secondError) {
+        throw new Error('Model returned unparseable JSON. Try again.');
+      }
+    }
+    
+    // Validate response
+    if (response.reveal !== true) {
+      throw new Error('Invalid response: expected reveal: true in REVEAL MODE');
+    }
+    
+    if (!response.gifts || response.gifts.length < 3) {
+      throw new Error('Invalid response: must include 3-7 gifts');
+    }
+    
+    // Validate each gift has required fields
+    const requiredGiftFields = ["giftName", "whyItsPerfect", "whatItConnectsTo", "experienceItCreates", "amazonSearch", "presentationIdea"];
+    response.gifts.forEach((gift, index) => {
+      requiredGiftFields.forEach(field => {
+        if (!gift[field]) {
+          throw new Error(`Gift #${index + 1} missing required field '${field}'`);
+        }
+      });
+    });
+    
+    console.log(`✅ Generated reveal: ${response.archetype} with ${response.gifts.length} gifts`);
+    
+    // 🔍 ENRICH GIFTS WITH REAL AMAZON LINKS
+    console.log('🔗 Fetching real Amazon product links...');
+    const enrichedGifts = await Promise.all(
+      response.gifts.map(async (gift) => {
+        const amazonData = await getAmazonLinkFromQuery(gift.amazonSearch);
+        return {
+          ...gift,
+          amazonUrl: amazonData.url,
+          amazonTitle: amazonData.title,
+          isDirectLink: !amazonData.isFallback
+        };
+      })
+    );
+    
+    response.gifts = enrichedGifts;
+    console.log(`✅ Enriched ${enrichedGifts.length} gifts with Amazon links`);
+    
+    // Generate sessionId for analytics tracking
+    const sessionId = Date.now().toString();
+    
+    // Store session data with sessionId
+    appData.sessions.push({
+      sessionId,
+      timestamp: new Date().toISOString(),
+      answersCount: answers.length,
+      archetype: response.archetype
+    });
+    saveData();
+    
+    // Add sessionId to response for frontend tracking
+    response.sessionId = sessionId;
+    
+    // Log response size
+    const responseSize = JSON.stringify(response).length;
+    console.log(`📦 Response size: ${responseSize} chars (${(responseSize / 1024).toFixed(2)} KB)`);
+    
+    if (responseSize > 100000) {
+      console.warn('⚠️  Response is very large, might cause issues');
+    }
+    
+    res.json(response);
+    
+  } catch (error) {
+    console.error('❌ [REVEAL MODE] Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 🎯 API ENDPOINT: REFINEMENT - ASK FOLLOW-UP QUESTIONS (After reveal feedback)
+app.post('/api/refine-question', async (req, res) => {
+  try {
+    const { answers = [], previousReveal = {}, refinementFeedback = '', refinementAnswers = [] } = req.body;
+    
+    console.log(`📥 [REFINEMENT QUESTION MODE] Follow-up Q${refinementAnswers.length + 1}/5`);
+    
+    // After 5 refinement questions, generate new gifts
+    if (refinementAnswers.length >= 5) {
+      return res.status(400).json({ 
+        error: 'Already have 5 refinement answers. Call /api/refine-reveal instead.' 
+      });
+    }
+    
+    // Prepare messages for OpenAI
+    const messages = [
+      { role: 'system', content: V4_ULTIMATE_SYSTEM },
+      { 
+        role: 'user', 
+        content: `MODE: REFINEMENT QUESTION
+
+Original 15 answers: ${JSON.stringify(answers)}
+
+Previous archetype: ${previousReveal.archetype}
+Previous gifts that didn't work: ${JSON.stringify(previousReveal.gifts?.map(g => g.giftName))}
+
+USER'S FEEDBACK: "${refinementFeedback}"
+
+${refinementAnswers.length > 0 ? `Refinement answers so far: ${JSON.stringify(refinementAnswers)}` : ''}
+
+This is refinement question ${refinementAnswers.length + 1} of 5.
+
+Based on their feedback, ask ONE specific follow-up question to understand what they actually want. Make it targeted to their feedback.
+
+For example:
+- If they said "too expensive" → ask about specific budget
+- If they said "already has that" → ask what categories to avoid
+- If they said "not their style" → ask more about aesthetic preferences
+- If they said "not practical" → ask about their daily routine/needs
+
+Return QUESTION MODE JSON schema (reveal: false).`
+      }
+    ];
+
+    const completion = await Promise.race([
+      openai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: messages,
+        response_format: { type: 'json_object' },
+        temperature: 0.7,
+        max_tokens: 500
+      }),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('OpenAI timeout after 30 seconds')), 30000)
+      )
+    ]);
+
+    let response;
+    try {
+      response = JSON.parse(completion.choices[0].message.content);
+    } catch (parseError) {
+      console.error('❌ JSON Parse Error:', parseError.message);
+      try {
+        const cleaned = completion.choices[0].message.content
+          .replace(/\n/g, ' ').replace(/\r/g, '').replace(/\t/g, ' ').trim();
+        response = JSON.parse(cleaned);
+        console.log('✅ JSON repaired successfully');
+      } catch (secondError) {
+        throw new Error('Model returned unparseable JSON. Try again.');
+      }
+    }
+    
+    // Validate
+    if (!response.question || !Array.isArray(response.options)) {
+      throw new Error('Model returned malformed question payload');
+    }
+    
+    // Override questionNumber to show refinement progress
+    response.questionNumber = refinementAnswers.length + 1;
+    response.isRefinementQuestion = true;
+    
+    if (response.reveal !== false) {
+      response.reveal = false;
+    }
+    
+    console.log(`✅ Generated refinement Q${response.questionNumber}: ${response.question.substring(0, 60)}...`);
+    
+    res.json(response);
+    
+  } catch (error) {
+    console.error('❌ [REFINEMENT QUESTION MODE] Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 🎯 API ENDPOINT: REFINEMENT REVEAL (After 5 follow-up questions)
+app.post('/api/refine-reveal', async (req, res) => {
+  try {
+    const { answers = [], previousReveal = {}, refinementFeedback = '', refinementAnswers = [] } = req.body;
+    
+    console.log(`📥 [REFINEMENT REVEAL MODE] Generating new gifts with ${refinementAnswers.length} refinement answers`);
+    
+    if (refinementAnswers.length < 5) {
+      return res.status(400).json({ 
+        error: 'Need 5 refinement answers. Keep asking questions.' 
+      });
+    }
+    
+    // Prepare messages for OpenAI
+    const messages = [
+      { role: 'system', content: V4_ULTIMATE_SYSTEM },
+      { 
+        role: 'user', 
+        content: `MODE: REFINEMENT REVEAL
+
+Original 15 answers: ${JSON.stringify(answers)}
+
+Previous archetype: ${previousReveal.archetype}
+Previous gifts that didn't work: ${JSON.stringify(previousReveal.gifts?.map(g => g.giftName))}
+
+USER'S INITIAL FEEDBACK: "${refinementFeedback}"
+
+FOLLOW-UP ANSWERS (5 questions):
+${JSON.stringify(refinementAnswers)}
+
+Now generate COMPLETELY NEW gift recommendations based on:
+1. The original 15 answers (their personality)
+2. Why the previous gifts didn't work
+3. The 5 new refinement answers
+
+Make the new gifts VERY different from the previous ones. Address their specific concerns.
+
+Return REVEAL MODE JSON schema with updated gifts.`
+      }
+    ];
+
+    console.log('🤖 Calling OpenAI for refined reveal...');
+    const startTime = Date.now();
+    
+    const completion = await Promise.race([
+      openai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: messages,
+        response_format: { type: 'json_object' },
+        temperature: 0.7,
+        max_tokens: 3000
+      }),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('OpenAI timeout after 45 seconds')), 45000)
+      )
+    ]);
+    
+    const elapsed = Date.now() - startTime;
+    console.log(`⏱️  OpenAI responded in ${elapsed}ms`);
+
+    let response;
+    try {
+      response = JSON.parse(completion.choices[0].message.content);
+    } catch (parseError) {
+      console.error('❌ JSON Parse Error:', parseError.message);
+      try {
+        const cleaned = completion.choices[0].message.content
+          .replace(/\n/g, ' ').replace(/\r/g, '').replace(/\t/g, ' ').trim();
+        response = JSON.parse(cleaned);
+        console.log('✅ JSON repaired successfully');
+      } catch (secondError) {
+        throw new Error('Model returned unparseable JSON. Try again.');
+      }
+    }
+    
+    // Validate response
+    if (response.reveal !== true) {
+      throw new Error('Invalid response: expected reveal: true in REFINEMENT REVEAL MODE');
+    }
+    
+    if (!response.gifts || response.gifts.length < 3) {
+      throw new Error('Invalid response: must include 3-7 gifts');
+    }
+    
+    // Validate each gift
+    const requiredGiftFields = ["giftName", "whyItsPerfect", "whatItConnectsTo", "experienceItCreates", "amazonSearch", "presentationIdea"];
+    response.gifts.forEach((gift, index) => {
+      requiredGiftFields.forEach(field => {
+        if (!gift[field]) {
+          throw new Error(`Gift #${index + 1} missing required field '${field}'`);
+        }
+      });
+    });
+    
+    console.log(`✅ Generated refined recommendations: ${response.gifts.length} gifts`);
+    
+    // 🔍 ENRICH REFINED GIFTS WITH REAL AMAZON LINKS
+    console.log('🔗 Fetching real Amazon product links for refined gifts...');
+    const enrichedGifts = await Promise.all(
+      response.gifts.map(async (gift) => {
+        const amazonData = await getAmazonLinkFromQuery(gift.amazonSearch);
+        return {
+          ...gift,
+          amazonUrl: amazonData.url,
+          amazonTitle: amazonData.title,
+          isDirectLink: !amazonData.isFallback
+        };
+      })
+    );
+    
+    response.gifts = enrichedGifts;
+    console.log(`✅ Enriched ${enrichedGifts.length} refined gifts with Amazon links`);
+    
+    // Add refinement flag
+    response.isRefinement = true;
+    
+    res.json(response);
+    
+  } catch (error) {
+    console.error('❌ [REFINEMENT REVEAL MODE] Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 📊 ANALYTICS & TRACKING ENDPOINTS
+
+app.post('/api/track-click', (req, res) => {
+  const { gift, archetype, sessionId } = req.body;
+  
+  appData.clicks.push({
+    timestamp: new Date().toISOString(),
+    gift,
+    archetype,
+    sessionId
+  });
+  
+  saveData();
+  res.json({ success: true });
+});
+
+app.post('/api/submit-feedback', (req, res) => {
+  const { sessionId, accuracy, giftRatings, archetype } = req.body;
+  
+  appData.feedback.push({
+    timestamp: new Date().toISOString(),
+    sessionId,
+    accuracy,
+    giftRatings,
+    archetype
+  });
+  
+  saveData();
+  res.json({ success: true });
+});
+
+app.get('/api/analytics', (req, res) => {
+  const analytics = {
+    totalClicks: appData.clicks.length,
+    totalFeedback: appData.feedback.length,
+    totalSessions: appData.sessions.length,
+    giftBreakdown: appData.clicks.reduce((acc, click) => {
+      acc[click.gift] = (acc[click.gift] || 0) + 1;
+      return acc;
+    }, {}),
+    accuracyBreakdown: appData.feedback.reduce((acc, fb) => {
+      acc[fb.accuracy] = (acc[fb.accuracy] || 0) + 1;
+      return acc;
+    }, {}),
+    archetypeBreakdown: appData.sessions.reduce((acc, s) => {
+      acc[s.archetype] = (acc[s.archetype] || 0) + 1;
+      return acc;
+    }, {})
+  };
+  
+  res.json(analytics);
+});
+
+app.get('/api/learning-insights', (req, res) => {
+  const insights = {
+    topGifts: Object.entries(
+      appData.clicks.reduce((acc, click) => {
+        acc[click.gift] = (acc[click.gift] || 0) + 1;
+        return acc;
+      }, {})
+    ).sort((a, b) => b[1] - a[1]).slice(0, 10),
+    
+    topArchetypes: Object.entries(
+      appData.sessions.reduce((acc, s) => {
+        acc[s.archetype] = (acc[s.archetype] || 0) + 1;
+        return acc;
+      }, {})
+    ).sort((a, b) => b[1] - a[1]).slice(0, 5),
+    
+    accuracyRate: appData.feedback.length > 0 
+      ? (appData.feedback.filter(f => f.accuracy === 'spot-on').length / appData.feedback.length * 100).toFixed(1) + '%'
+      : 'No data yet',
+    
+    lovedGifts: Object.entries(
+      appData.feedback.flatMap(f => 
+        Object.entries(f.giftRatings || {})
+          .filter(([_, rating]) => rating === 'love')
+          .map(([gift]) => gift)
+      ).reduce((acc, gift) => {
+        acc[gift] = (acc[gift] || 0) + 1;
+        return acc;
+      }, {})
+    ).sort((a, b) => b[1] - a[1]).slice(0, 5),
+    
+    totalDataPoints: appData.feedback.length
+  };
+  
+  res.json(insights);
+});
+
+// 🏥 HEALTH CHECK
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    message: 'Giftinator V4 - Production System',
+    version: '4.0.0'
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'healthy' });
+});
+
+// 🚀 START SERVER
+const PORT = process.env.PORT || 3000;
+const HOST = '0.0.0.0';
+
+app.listen(PORT, HOST, () => {
+  console.log(`\n🎁 GIFTINATOR V4 - PRODUCTION SYSTEM`);
+  console.log(`📍 Running on ${HOST}:${PORT}`);
+  console.log(`\n📡 Endpoints:`);
+  console.log(`   POST /api/next-question - Get next question (QUESTION MODE)`);
+  console.log(`   POST /api/reveal - Generate profile + gifts (REVEAL MODE)`);
+  console.log(`   POST /api/track-click - Track Amazon clicks`);
+  console.log(`   POST /api/submit-feedback - Submit user feedback`);
+  console.log(`   GET  /api/analytics - View analytics`);
+  console.log(`   GET  /api/learning-insights - View learning data`);
+  console.log(`\n✅ Ready for requests\n`);
+});
